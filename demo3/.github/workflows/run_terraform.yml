@@ -1,0 +1,130 @@
+name: "Run Terraform"
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        required: true
+        type: string
+      command:
+        required: true
+        type: string
+
+env:
+  TF_LOG: INFO
+  FASTLY_API_KEY: ${{ secrets.FASTLY_API_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  BACKEND_ROLE_ARN: ${{ secrets.BACKEND_ROLE_ARN }}
+  BACKEND_BUCKET: ${{ secrets.BACKEND_BUCKET }}
+  BACKEND_DYNAMO_DB: ${{ secrets.BACKEND_DYNAMODB_TABLE }}
+
+jobs:
+  terraform:
+    name: "Terraform"
+    runs-on: ubuntu-latest
+
+    # Use the Bash shell
+    # Set the working directory according to the input passed from the caller workflow
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      # Checkout the repository to the GitHub Actions runner
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Get the pull request number
+      - name: Get Pull Request Number
+        uses: actions/github-script@v7
+        id: get_issue_number
+        with:
+          script: |
+            if (context.issue.number) {
+              // Return issue number if present
+              return context.issue.number;
+            } else {
+              // Try to get issue number from commit
+              const pr = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                commit_sha: context.sha,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              
+              if (pr.data && pr.data.length > 0) {
+                return pr.data[0].number;
+              } else {
+                // Return an empty string if no pull request is found
+                return "";
+              }
+            }
+          result-encoding: string
+
+      - name: Set TF_VAR_version_comment
+        if: steps.get_issue_number.outputs.result != ''
+        run: echo "TF_VAR_version_comment=PR#${{ steps.get_issue_number.outputs.result }}" >> $GITHUB_ENV
+
+      # Install the preferred version of Terraform CLI
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.4.5
+
+      - name: terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init
+        id: init
+        run: >
+          terraform init
+          -backend-config="role_arn=$BACKEND_ROLE_ARN"
+          -backend-config="bucket=$BACKEND_BUCKET"
+          -backend-config="dynamodb_table=$BACKEND_DYNAMODB_TABLE"
+
+      - name: terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      # Run terraform plan triggered by PR or workflow_dispatch with "plan" as input
+      - name: terraform plan
+        id: plan
+        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.command == 'plan')
+        run: terraform plan -no-color
+
+      # Add a comment to pull requests with plan results
+      - name: add-plan-comment
+        id: comment
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖${{ steps.validate.outputs.stdout }}
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`${process.env.PLAN}\`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ inputs.working-directory }}\`, Workflow: \`${{ github.workflow }}\`*`;
+              
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      # Run terraform apply triggered by push/merge or workflow_dispatch with "apply" as input
+      - name: terraform apply
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.command == 'apply')
+        run: terraform apply -auto-approve

@@ -1,0 +1,27 @@
+name: "Deploy Cert"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cert/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "cert/**"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Terraform command to run"
+        type: choice
+        options:
+          - plan
+          - apply
+
+jobs:
+  run-terraform:
+    uses: ./.github/workflows/run_terraform.yml
+    with:
+      working-directory: cert/
+      command: ${{ github.event.inputs.command }}
+    secrets: inherit
